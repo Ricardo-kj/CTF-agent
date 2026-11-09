@@ -61,8 +61,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PROTOCOL = "ctfy-agent/0-draft"
+AGENT_NAME = os.environ.get("AGENT_NAME", "ctf-agent")
 
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
 API_KEY = os.environ.get("LLM_API_KEY", "") or os.environ.get("DEEPSEEK_API_KEY", "") \
@@ -367,14 +368,18 @@ def solve(task: dict) -> dict:
 
         return {
             "status": "solved" if flag else "failed",
+            "ok": bool(flag),
+            "solved": bool(flag),
             "flag": flag,
+            "answer": flag,
             "steps": len(trace),
             "trace": trace[-60:],
             "error": "",
         }
     except Exception as e:  # noqa: BLE001
         log("solve 异常", traceback.format_exc())
-        return {"status": "failed", "flag": "", "steps": 0, "trace": [],
+        return {"status": "failed", "ok": False, "solved": False, "flag": "",
+                "answer": "", "steps": 0, "trace": [],
                 "error": f"{type(e).__name__}: {e}"}
     finally:
         WORKDIR = prev
@@ -406,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok"})
         elif path == "/meta":
             self._json(200, {
-                "name": os.environ.get("AGENT_NAME", "ctfy-agent-starter"),
+                "name": AGENT_NAME,
                 "version": VERSION,
                 "protocol": PROTOCOL,
                 "model": MODEL,
@@ -442,13 +447,7 @@ class Handler(BaseHTTPRequestHandler):
         log("http", fmt % args)
 
 
-def main():
-    # 容器 / Windows 控制台编码不一致时，别让一条日志把请求线程带崩
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            pass
+def serve_http():
     WORKDIR.mkdir(parents=True, exist_ok=True)
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log(f"listening on 0.0.0.0:{PORT}, workdir={WORKDIR}, model={MODEL}, "
@@ -457,6 +456,210 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+# --------------------------------------------------------------------------
+# 命令行契约：平台是「按参数跑一次 -> 写出结果文件 -> 退出」
+# --------------------------------------------------------------------------
+#
+# 平台反馈原文：
+#   协议检查：发现问题 —— 没写结果文件；忽略了 dry-run 标记
+#   试运行：失败 —— 超过试运行时限仍未写出结果文件
+#
+# 所以入口必须做到：
+#   1) 认 --dry-run（或 DRY_RUN=1 / ./dry-run 标记文件）：立刻写结果文件并退出，不调模型；
+#   2) 正常跑：从 --input 或 /input/*.json 读任务，解完写结果文件并退出；
+#   3) 结果文件写到 --output 指定的路径，同时兜底写几个常见位置（/output/result.json 等）。
+#
+# 具体路径/字段以 CTFY-0001 为准；这里把常见写法都覆盖了。
+
+FLAG_DRY = {"--dry-run", "--dry_run", "--dryrun", "-n", "--check"}
+FLAG_SERVE = {"--serve", "--server", "--http"}
+TAKE_INPUT = {"--input", "-i", "--task", "--task-file", "--in"}
+TAKE_OUTPUT = {"--output", "-o", "--out", "--result", "--result-file",
+               "--result_path", "--result-path", "--output-file"}
+
+
+def _env_truthy(names) -> bool:
+    for n in names:
+        if (os.environ.get(n) or "").strip().lower() in ("1", "true", "yes", "on", "y"):
+            return True
+    return False
+
+
+def parse_cli(argv) -> dict:
+    o = {"dry_run": False, "serve": False, "inputs": [], "outputs": [],
+         "inline": None, "positional": []}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        low = a.lower()
+        if low in FLAG_DRY or low.startswith("--dry-run="):
+            o["dry_run"] = True
+        elif low in FLAG_SERVE:
+            o["serve"] = True
+        elif low in TAKE_INPUT and i + 1 < len(argv):
+            o["inputs"].append(argv[i + 1])
+            i += 1
+        elif any(low.startswith(k + "=") for k in TAKE_INPUT):
+            o["inputs"].append(a.split("=", 1)[1])
+        elif low in TAKE_OUTPUT and i + 1 < len(argv):
+            o["outputs"].append(argv[i + 1])
+            i += 1
+        elif any(low.startswith(k + "=") for k in TAKE_OUTPUT):
+            o["outputs"].append(a.split("=", 1)[1])
+        elif a.startswith("{"):
+            o["inline"] = a
+        elif not a.startswith("-"):
+            o["positional"].append(a)
+        i += 1
+
+    # 位置参数猜一下：已存在的当输入，不存在的 .json 当输出
+    for p in o["positional"]:
+        if Path(p).exists():
+            o["inputs"].append(p)
+        elif p.lower().endswith((".json", ".jsonl", ".txt")):
+            o["outputs"].append(p)
+        else:
+            o["inputs"].append(p)
+    return o
+
+
+def _load_json_file(p: Path):
+    try:
+        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception as e:  # noqa: BLE001
+        log("输入解析失败", str(p), e)
+        return None
+
+
+def load_task(opts: dict):
+    """按 --input / 环境变量 / 常见挂载路径 的顺序找任务。"""
+    if opts.get("inline"):
+        try:
+            return json.loads(opts["inline"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    cands = list(opts["inputs"])
+    for n in ("TASK_FILE", "TASK", "INPUT_FILE", "INPUT"):
+        v = os.environ.get(n)
+        if v:
+            cands.append(v)
+    cands += ["/input/task.json", "/task.json", "/workspace/task.json",
+              "task.json", "/app/task.json"]
+
+    for c in cands:
+        p = Path(c)
+        if p.is_dir():
+            js = sorted(p.glob("*.json"))
+            if not js:
+                continue
+            p = js[0]
+        if p.is_file():
+            data = _load_json_file(p)
+            if data is not None:
+                return data
+
+    d = Path("/input")
+    if d.is_dir():
+        for p in sorted(d.glob("*.json")):
+            data = _load_json_file(p)
+            if data is not None:
+                return data
+    return None
+
+
+def write_result(payload: dict, outputs=()) -> list:
+    """把结果写到所有可能的位置；返回成功写入的路径列表。"""
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    paths = list(outputs)
+    for n in ("OUTPUT_FILE", "RESULT_FILE", "RESULT_PATH", "OUTPUT", "OUT_DIR"):
+        v = os.environ.get(n)
+        if v:
+            paths.append(v)
+    paths += ["/output/result.json", "/output.json", "/result.json",
+              "/tmp/result.json", "result.json", "/workspace/result.json"]
+
+    seen, written = set(), []
+    for raw in paths:
+        p = Path(raw)
+        try:
+            if raw.endswith(("/", "\\")) or p.is_dir():
+                p = p / "result.json"
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+            written.append(key)
+        except Exception:  # noqa: BLE001  某些路径只读，跳过即可
+            continue
+
+    print(body, flush=True)
+    print("RESULT_FILES=" + ",".join(written), flush=True)
+    log("已写结果文件:", written or "（无，权限不足？）")
+    return written
+
+
+def main():
+    # 容器 / Windows 控制台编码不一致时，别让一条日志把请求线程带崩
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
+    opts = parse_cli(sys.argv[1:])
+    dry = (opts["dry_run"]
+           or _env_truthy(("DRY_RUN", "CTFY_DRY_RUN", "AGENT_DRY_RUN", "DRYRUN"))
+           or Path("dry-run").exists() or Path("/input/dry-run").exists())
+    log("argv=", sys.argv[1:], "dry_run=", dry)
+
+    if dry:
+        # dry-run 只在验证协议：立刻回一个「我准备好了」，不碰模型
+        write_result({
+            "status": "ok",
+            "ok": True,
+            "dry_run": True,
+            "ready": True,
+            "agent": AGENT_NAME,
+            "name": AGENT_NAME,
+            "version": VERSION,
+            "protocol": PROTOCOL,
+            "model": MODEL,
+            "model_configured": bool(API_KEY),
+            "capabilities": ["bash", "read_file", "write_file", "http_request"],
+        }, opts["outputs"])
+        return
+
+    task = load_task(opts)
+    if task is not None:
+        write_result(solve(task), opts["outputs"])
+        return
+
+    if opts["serve"] or _env_truthy(("SERVE", "HTTP_MODE")):
+        serve_http()
+        return
+
+    # 没给任务也没开 serve：等一小会儿（平台可能稍后才挂输入），仍没有就写失败结果退出，
+    # 至少不会「超时且没有任何文件」。
+    wait = int(os.environ.get("WAIT_INPUT_SECONDS", "25"))
+    log(f"没有找到任务输入，最多等 {wait}s …")
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(1)
+        task = load_task(opts)
+        if task is not None:
+            write_result(solve(task), opts["outputs"])
+            return
+    write_result({
+        "status": "failed",
+        "flag": "",
+        "error": "没有找到任务输入文件",
+        "hint": "支持 --input <path>、/input/task.json、TASK_FILE 环境变量",
+    }, opts["outputs"])
 
 
 if __name__ == "__main__":
